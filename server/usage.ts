@@ -786,11 +786,14 @@ async function readKeychainInLoginSession(service: string, account?: string): Pr
   return runInLoginSession(["/usr/bin/security", "find-generic-password", "-s", service, ...(account ? ["-a", account] : []), "-w"]);
 }
 
+/** launchd labels must be unique per call: concurrent reads for different config dirs can start in the same millisecond. */
+let loginSessionJobs = 0;
+
 /** A command's trimmed stdout, run as a one-shot launchd job in the login session; null as above. */
 async function runInLoginSession(args: string[], env: Record<string, string> = {}, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string | null> {
   if (process.platform !== "darwin" || typeof process.getuid !== "function") return null;
   const domain = `gui/${process.getuid()}`;
-  const label = `dev.herdr-web-ui.login-session.${process.pid}.${Date.now()}`;
+  const label = `dev.herdr-web-ui.login-session.${process.pid}.${Date.now()}.${++loginSessionJobs}`;
   const dir = mkdtempSync(join(tmpdir(), "herdr-web-ui-keychain-"));
   const fifo = join(dir, "out");
   const plist = join(dir, "job.plist");
