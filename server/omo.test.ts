@@ -35,6 +35,9 @@ it("takes the engine a global bun install hoists next to omo-ai for omo when it 
   expect(isOmoProcess(["bun", "/home/u/tools/watch.js", "--extension", `${modules}/omo-ai/plugin`])).toBeFalse();
   expect(isOmoProcess(["bun", `${modules}/@code-yeongyu/senpi/dist/bundle/cli.js`, `${modules}/omo-ai/plugin`])).toBeFalse();
   expect(isOmoProcess([`${modules}/@code-yeongyu/senpi/dist/bundle/cli.js`, "--extension", `${modules}/omo-ai/plugin`])).toBeFalse();
+  // words after `--` are the prompt: senpi loads no extension from them
+  expect(isOmoProcess(["bun", `${modules}/@code-yeongyu/senpi/dist/bundle/cli.js`, "--", "Explain", "--extension", `${modules}/omo-ai/plugin`])).toBeFalse();
+  expect(isOmoProcess(["bun", `${modules}/@code-yeongyu/senpi/dist/bundle/cli.js`, "--extension", `${modules}/omo-ai/plugin`, "--", "Explain"])).toBeTrue();
 });
 
 it("does not take an omo path given to another program for omo", () => {

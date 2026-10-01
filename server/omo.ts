@@ -20,13 +20,17 @@ const OMO_EXTENSION = /\/omo-ai\/plugin\/?$/;
  * A global bun install hoists omo's engine next to omo-ai instead of inside it
  * (`bun …/node_modules/@code-yeongyu/senpi/dist/bundle/cli.js --extension …/node_modules/omo-ai/plugin`):
  * the script is then senpi's own entry, and omo-ai shows only as the extension it loads.
+ * Words after a `--` are the prompt, not options: senpi loads no extension from them.
  */
 export function isOmoProcess(argv: readonly string[]): boolean {
   const runtime = JS_RUNTIME.test(argv[0] ?? "");
   const program = runtime ? argv.slice(1).find((word) => !word.startsWith("-")) : argv[0];
   if (program === undefined || program.includes(":")) return false;
   if (OMO_PROCESS.test(program)) return true;
-  return runtime && SENPI_ENTRY.test(program) && argv.some((word, at) => argv[at - 1] === "--extension" && !word.includes(":") && OMO_EXTENSION.test(word));
+  if (!runtime || !SENPI_ENTRY.test(program)) return false;
+  const prompt = argv.indexOf("--", argv.indexOf(program));
+  const options = prompt === -1 ? argv : argv.slice(0, prompt);
+  return options.some((word, at) => options[at - 1] === "--extension" && !word.includes(":") && OMO_EXTENSION.test(word));
 }
 
 export interface OmoCandidate { path: string; id: string; createdAt: number | null }
