@@ -7,6 +7,14 @@ between releases do not reach them. Remote-PC runtime bundles are versioned sepa
 
 ## [Unreleased]
 
+### Fixed
+- The chat shows the conversation of OmO installed with `bun add -g omo-ai` again, and the
+  sidebar marks its pane as OmO. A global bun install puts OmO's engine next to omo-ai rather
+  than inside it, so the pane runs `bun …/@code-yeongyu/senpi/dist/bundle/cli.js --extension
+  …/omo-ai/plugin`, and 0.3.40 no longer took it for OmO: the chat found no conversation and
+  New session did not see OmO start. That engine counts as OmO again when omo-ai's plugin is one
+  of its extensions.
+
 ## [0.3.40] - 2026-10-01
 
 ### Fixed
