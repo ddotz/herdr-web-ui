@@ -8,6 +8,38 @@ between releases do not reach them. Remote-PC runtime bundles are versioned sepa
 ## [Unreleased]
 
 ### Fixed
+- Claude's subscription usage no longer shows a locked keychain on a Mac whose server was
+  started outside the desktop session (over SSH, or by a detached multiplexer), where
+  `security` cannot open the login keychain. The item is read through a one-shot launchd job
+  in the desktop session instead.
+
+## [0.3.40] - 2026-10-01
+
+### Fixed
+- Korean, Japanese and Chinese in the terminal no longer look spread apart on an iPhone. iOS has
+  no font that draws Hangul as wide as two terminal cells, so every syllable sat at the left of
+  its cells with a 4px gap after it. A character narrower than its cells is now drawn larger
+  (up to 1.2×) and centered in them. Vietnamese written with separate accent marks, as in a
+  file name from a Mac, now shows every mark on iPhone; Safari drew only the first one. The ⏺
+  before every Claude Code message is drawn as a symbol in its cell on iPhone, no longer as a
+  blue emoji over the next character
+  ([#272](https://github.com/devswha/herdr-web-ui/pull/272)).
+- Several lines pasted into the terminal of a Windows PC stay in an agent's message box until
+  you send them. Gajae Code took the first line break for Enter and sent the first line alone.
+  PowerShell and cmd still run a pasted block line by line. Enter, Ctrl+C, Esc, Tab and the
+  arrows were checked on a real PC and already worked
+  ([#267](https://github.com/devswha/herdr-web-ui/pull/267)).
+- A bridge that cannot run the PTY sidecar (no Node, or no `@lydell/node-pty`, as in the Windows
+  bundle) keeps mirroring its panes even when herdr reports terminal attach. It used to leave
+  the working mirror for an attach it could not start, and the terminal ended at once.
+  `/api/health` and the PC list say `terminal_attach: false` and `terminal_mirror: true` there.
+  The real terminal on Windows therefore needs a bundle that ships the sidecar, not only a
+  herdr that attaches ([#265](https://github.com/devswha/herdr-web-ui/pull/265)).
+- A password entered from the secret prompt on a mirrored terminal (a PC whose herdr cannot
+  attach, as on Windows) is reported as entered only after herdr took it, and a send herdr
+  refused is reported as failed instead of as done. Enter is now pressed as a key after the
+  text, not sent as a carriage return inside it
+  ([#263](https://github.com/devswha/herdr-web-ui/pull/263)).
 - A pane running a command that is only given an omo path (`grep -q …/omo-ai/x`, `cat …/bin/omo`) is
   no longer shown as OmO or counted as a second OmO in its folder. Only the program a pane runs
   counts, or the script that node or bun runs
@@ -25,10 +57,22 @@ between releases do not reach them. Remote-PC runtime bundles are versioned sepa
   that also rewrites `Host` and adds nothing, as nginx's plain `proxy_pass` does, still cannot
   be told from this computer, so set a token behind a proxy. The guide has Caddy and nginx
   examples to copy ([#252](https://github.com/devswha/herdr-web-ui/pull/252)).
-- Claude's subscription usage no longer shows a locked keychain on a Mac whose server was
-  started outside the desktop session (over SSH, or by a detached multiplexer), where
-  `security` cannot open the login keychain. The item is read through a one-shot launchd job
-  in the desktop session instead.
+- The chat lens finds the conversation of a Gajae Code pane and of an omp pane on a Windows PC.
+  Both lookups compared paths with `/`, which a Windows path does not have, and Gajae Code was
+  looked for only among the processes herdr names, which on Windows is the pane's shell alone.
+  Paths are now compared by the PC's own rules, and Gajae Code is found among the shell's child
+  processes, then matched by the text on screen. Once matched, the pane keeps its conversation
+  while that Gajae Code process runs, so a long list or tool output that pushes every answer off
+  the screen no longer drops the chat, and the PC's process list is read once every few seconds
+  instead of on every poll. A path that leaves the store through `..` is
+  refused on every platform. A Windows PC gets this with the next remote bundle
+  ([#264](https://github.com/devswha/herdr-web-ui/pull/264)).
+- Emoji in the terminal take as many cells as herdr gives them, so a line with emoji no longer
+  shifts: the browser counted most emoji, and the ⚠️ kind with a selector, as one cell, and an
+  emoji sequence such as 👨‍👩‍👧 as one cell per emoji. The next letter overlapped the emoji, parts
+  of the sequence were overwritten, and stray characters stayed behind. Thai and Indic vowel
+  signs and invisible characters such as a zero-width space are counted as herdr counts them too
+  ([#273](https://github.com/devswha/herdr-web-ui/pull/273)).
 
 ## [0.3.39] - 2026-10-01
 
@@ -1023,7 +1067,8 @@ First public version.
 - Installable PWA, a mobile key bar, web push alerts and optional token auth.
 - Distribution as a herdr plugin.
 
-[Unreleased]: https://github.com/devswha/herdr-web-ui/compare/v0.3.39...HEAD
+[Unreleased]: https://github.com/devswha/herdr-web-ui/compare/v0.3.40...HEAD
+[0.3.40]: https://github.com/devswha/herdr-web-ui/compare/v0.3.39...v0.3.40
 [0.3.39]: https://github.com/devswha/herdr-web-ui/compare/v0.3.38...v0.3.39
 [0.3.38]: https://github.com/devswha/herdr-web-ui/compare/v0.3.37...v0.3.38
 [0.3.37]: https://github.com/devswha/herdr-web-ui/compare/v0.3.36...v0.3.37

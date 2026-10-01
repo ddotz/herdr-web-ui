@@ -14,6 +14,7 @@ import { MAX_COMPOSER_CHARS, QUEUE_READY_STATUS, composerMessage, composerPayloa
 import { answerFromText, answerHint, answerRefusal, needsConfirmation, type TypedAnswer } from "../lib/promptAnswer.ts";
 import { ApiError, fetchPaneScroll, fetchPaneSelection, scrollPane } from "../lib/api.ts";
 import { parseOsc52 } from "../lib/osc52.ts";
+import { matchHerdrWidths } from "../lib/terminalWidths.ts";
 import { useMachineApi, useMachineId } from "../lib/machineContext.tsx";
 import { paneStorageId } from "../../shared/machines.ts";
 import { KeyBar } from "./KeyBar.tsx";
@@ -27,6 +28,7 @@ import type { PaneView } from "../lib/actions.ts";
 import { terminalTheme, type Palette, type ResolvedTheme } from "../lib/settings.ts";
 import { useT } from "../lib/i18n.ts";
 import { isAppShortcut } from "../lib/shortcuts.ts";
+import { adjustTerminalGlyphs } from "../lib/terminalGlyphs.ts";
 
 // xterm sizes every cell from the first matching font, so a proportional one (Malgun Gothic)
 // must never win it: it stays behind the generic monospace as a per-glyph Hangul fallback
@@ -122,7 +124,7 @@ export function PaneTerminal({
   const [outputReady, setOutputReady] = useState(false);
   const [ended, setEnded] = useState(false);
   const [outputError, setOutputError] = useState<string | null>(null);
-  // this PC's herdr has no terminal attach (Windows): the lens is a notice, the chat still works
+  // the server answered terminal_unsupported (a bridge too old to mirror): the lens is a notice, the chat still works
   const [unsupported, setUnsupported] = useState(false);
   // another web bridge has this pane's terminal: the server waits for it and says attach-resumed
   const [held, setHeldState] = useState(false);
@@ -243,9 +245,11 @@ export function PaneTerminal({
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    matchHerdrWidths(term);
     // an address in the terminal opens in a new tab; the page never navigates away from the pane
     term.loadAddon(new WebLinksAddon((_event, uri) => { window.open(uri, "_blank", "noopener,noreferrer"); }));
     term.open(host);
+    const stopGlyphs = adjustTerminalGlyphs(term);
     // Let the browser emit a paste event, which xterm already handles (including
     // bracketed paste). Otherwise Ctrl+V becomes 0x16, triggering the agent's
     // image-paste shortcut against the server's clipboard and canceling text paste.
@@ -808,6 +812,7 @@ export function PaneTerminal({
       if (clipboardTimerRef.current !== null) window.clearTimeout(clipboardTimerRef.current);
       off();
       socket.close();
+      stopGlyphs();
       term.dispose();
       termRef.current = null;
       socketRef.current = null;

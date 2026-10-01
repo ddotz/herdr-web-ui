@@ -47,7 +47,9 @@ import { codexQuestionsCollapsed, handlePromptRequest } from "./prompt.ts";
 import { secretPrompt, validSecret } from "../shared/secret-prompt.ts";
 import { PasteImageError, savePaneImage } from "./paste.ts";
 import { PtySession } from "./pty/session.ts";
+import { attachableIdentity, sidecarAvailable } from "./pty/sidecar.ts";
 import { MirrorSession } from "./mirror.ts";
+import { mirrorInput } from "./mirror-input.ts";
 import { OutputWindow, OUTPUT_HIGH_BYTES, OUTPUT_HARD_BYTES, OUTPUT_STALL_MS, ReplayBuffer } from "./output-window.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../shared/terminal-flow.ts";
 import { connectUpdater, handleUpdateRequest, type UpdateService } from "./update-api.ts";
@@ -234,16 +236,20 @@ export function createServer(
     attachRetryForMs?: number;
     /** ATTACH_HELD_RETRY_MS; tests shorten it */
     attachHeldRetryMs?: number;
-    /** whether herdr can `terminal attach`; unset, its ping says. Tests give a Windows herdr's answer, at once or as late as a ping's. */
+    /** whether herdr can `terminal attach`; unset, its ping says, and this runtime's PTY sidecar has to be runnable. Tests give a Windows herdr's answer, at once or as late as a ping's. */
     terminalAttach?: boolean | (() => Promise<boolean>);
+    /** whether this runtime can run the PTY sidecar; unset, server/pty/sidecar.ts says. Tests give a runtime without Node or node-pty, while herdr keeps its own answer. */
+    sidecar?: boolean;
   } = {},
 ): { port: number; hostname: string; stop: () => void } {
   const attachments = new Map<string, PaneAttachment>();
-  /** whether this herdr can `terminal attach`: asked once, the answer never changes while it runs */
+  /** whether this bridge can `terminal attach`: herdr is asked once, and the PTY sidecar has to be runnable here (server/pty/sidecar.ts) */
+  /** whether the sidecar can run, settled as the server starts so that attach, /api/health and /api/bridge tell one answer; a forced answer (tests) stands in for it */
+  const sidecar = options.sidecar ?? (options.terminalAttach === undefined ? sidecarAvailable() : options.terminalAttach !== false);
   let terminalAttachKnown: boolean | null = typeof options.terminalAttach === "boolean" ? options.terminalAttach : null;
   const terminalAttach = async (): Promise<boolean> => {
     if (terminalAttachKnown === null) {
-      terminalAttachKnown = typeof options.terminalAttach === "function" ? await options.terminalAttach() : (await ping()).terminal_attach !== false;
+      terminalAttachKnown = typeof options.terminalAttach === "function" ? await options.terminalAttach() : attachableIdentity(await ping(), sidecar).terminal_attach !== false;
     }
     return terminalAttachKnown;
   };
@@ -775,7 +781,7 @@ export function createServer(
 
       if (pathname === "/api/bridge") {
         if (token === "" && !bridgeAuthorized) return unauthorizedJson();
-        try { return jsonResponse(await bridgeIdentity()); } catch (error) { return errorResponse(error); }
+        try { return jsonResponse(await bridgeIdentity(sidecar)); } catch (error) { return errorResponse(error); }
       }
       if (pathname === "/api/machines" || pathname.startsWith("/api/machines/")) {
         if (!machines) return jsonResponse({ error: { code: "bridge_only", message: "Manage PCs on the connection server" } }, 404);
@@ -853,8 +859,8 @@ export function createServer(
         if (url.searchParams.get("scope") === "bridge") return jsonResponse({ ok: true, auth, bridge_protocol: BRIDGE_PROTOCOL });
         try {
           const info = await ping();
-          // a forced answer (tests) is told the way a Windows herdr's own would be
-          const herdr = options.terminalAttach === false ? { ...info, terminal_attach: false, terminal_mirror: true } : info;
+          // a forced answer (tests) and a runtime without the PTY sidecar are told the way a Windows herdr's own would be
+          const herdr = attachableIdentity(info, sidecar);
           return jsonResponse({ ok: true, herdr, auth,
             web_ui: { boot_id: process.env["HERDR_WEB_BOOT_ID"] ?? null, revision: process.env["HERDR_WEB_REVISION"] ?? null } });
         } catch (error) {
@@ -1383,10 +1389,12 @@ export function createServer(
                 void serialize(message.pane_id, async () => {
                   // a herdr that attaches: typing reaches an attached pane only
                   if (await terminalAttach()) return;
+                  // a pasted block asks herdr what the pane runs, so it is shaped before the checks below
+                  const shaped = await mirrorInput(text, process.platform === "win32", async () => (await paneContext(message.pane_id)).agent);
                   // nothing typed outlives its connection
                   if (!clients.has(client)) return;
                   authorizeSocket(client);
-                  return paneSendText(message.pane_id, text);
+                  return paneSendText(message.pane_id, shaped);
                 }).catch(() => undefined);
                 break;
               }
@@ -1466,8 +1474,16 @@ export function createServer(
                   authorizeSocket(client);
                   if (!attachment.clients.has(client) || attachments.get(message.pane_id) !== attachment) { result(false, "not_attached"); return; }
                   if (secretPrompt(screen.text, attachment.cols) !== message.prompt) { result(false, "prompt_changed"); return; }
-                  // Direct attach keystrokes: no agent transcript, RPC payload or delayed Enter.
-                  attachment.pty.write(`${message.secret}\r`);
+                  if (attachment.mirror) {
+                    // A mirrored pane has no pty to type into: the secret is herdr's text, then the
+                    // Enter key (a `\r` inside the text is not Enter to every shell). Both are awaited,
+                    // so a send herdr refused is answered as failed, not as entered.
+                    await paneSendText(message.pane_id, message.secret);
+                    await paneSendKeys(message.pane_id, ["Enter"]);
+                  } else {
+                    // Direct attach keystrokes: no agent transcript, RPC payload or delayed Enter.
+                    attachment.pty.write(`${message.secret}\r`);
+                  }
                   result(true);
                 });
               } catch {
