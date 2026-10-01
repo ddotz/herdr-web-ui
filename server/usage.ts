@@ -692,22 +692,28 @@ async function readKeychainInLoginSession(service: string, account?: string): Pr
 `, { mode: 0o600 });
     // open for reading before the job starts; the open completes when the job opens its stdout
     const reading = open(fifo, "r").then(async (handle) => {
-      try { return (await handle.readFile("utf8")).trim(); } finally { await handle.close(); }
+      try {
+        const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
+        let size = 0;
+        for (let read = 1; read > 0 && size <= MAX_READ_BYTES; size += read) ({ bytesRead: read } = await handle.read(buffer, size, buffer.length - size, null));
+        return size > MAX_READ_BYTES ? null : buffer.toString("utf8", 0, size).trim();
+      } finally { await handle.close(); }
     });
-    if (await launchctl(["bootstrap", domain, plist]) !== 0) {
+    const loaded = await launchctl(["bootstrap", domain, plist]).catch(() => -1);
+    if (loaded !== 0) {
       closeSync(openSync(fifo, "r+")); // releases the pending reader
       await reading.catch(() => "");
       return null;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<string>((resolve) => { timer = setTimeout(() => { closeSync(openSync(fifo, "r+")); resolve(""); }, COMMAND_TIMEOUT_MS); });
+    const timeout = new Promise<string | null>((resolve) => { timer = setTimeout(() => { closeSync(openSync(fifo, "r+")); resolve(""); }, COMMAND_TIMEOUT_MS); });
     const value = await Promise.race([reading.catch(() => ""), timeout]);
     clearTimeout(timer);
     return value ? value : null;
   } catch {
     return null;
   } finally {
-    await launchctl(["bootout", `${domain}/${label}`]);
+    await launchctl(["bootout", `${domain}/${label}`]).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 }
