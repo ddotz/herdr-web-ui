@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UsageReport } from "../shared/protocol.ts";
-import { FRESH_MS, handleUsageRequest, MAX_READ_BYTES, MIN_REFRESH_MS, RETRY_MS, runCommand, USAGE_PROVIDERS, UsageHttpError, UsageService, type KeychainRead, type UsageContext, type UsageProvider } from "./usage.ts";
+import { CLAUDE_SELF_REFRESH_RETRY_MS, FRESH_MS, handleUsageRequest, MAX_READ_BYTES, MIN_REFRESH_MS, RETRY_MS, runCommand, USAGE_PROVIDERS, UsageHttpError, UsageService, type KeychainRead, type UsageContext, type UsageProvider } from "./usage.ts";
 
 const NOW = Date.parse("2026-09-29T12:00:00Z");
 const HOUR = 3600_000;
@@ -22,6 +22,9 @@ let replies: Map<string, Reply>;
 let requests: Array<{ url: string; init: RequestInit }>;
 let keychain: Map<string, KeychainRead>;
 let commands: Map<string, string>;
+/** config dirs `claude auth status` was run for (null: the default), and what it does meanwhile */
+let authStatus: Array<string | null>;
+let onAuthStatus: (configDir: string | null) => Promise<void> | void;
 
 function context(platform: NodeJS.Platform = "linux"): UsageContext {
   return {
@@ -36,6 +39,10 @@ function context(platform: NodeJS.Platform = "linux"): UsageContext {
     },
     keychain: async (service, account) => keychain.get(`${service}|${account ?? ""}`) ?? { status: "missing" },
     run: async (argv) => commands.get(argv.join(" ")) ?? null,
+    async claudeAuthStatus(configDir) {
+      authStatus.push(configDir);
+      await onAuthStatus(configDir);
+    },
   };
 }
 
@@ -78,6 +85,8 @@ beforeEach(() => {
   requests = [];
   keychain = new Map();
   commands = new Map();
+  authStatus = [];
+  onAuthStatus = () => {};
 });
 
 afterEach(() => rmSync(home, { recursive: true, force: true }));
@@ -350,6 +359,97 @@ describe("providers", () => {
       { kind: "session", scope: null, used_percent: 25, resets_at: "2026-09-29T16:00:00.000Z" },
       { kind: "session", scope: "Other models", used_percent: 100, resets_at: "2026-09-29T15:00:00.000Z" },
     ]);
+  });
+});
+
+describe("Claude Code's sign-in, borrowed and never owned", () => {
+  const USAGE = "https://api.anthropic.com/api/oauth/usage";
+  const PROFILE = "https://api.anthropic.com/api/oauth/profile";
+  const claudeCode = (token: string, expiresAt: number) => JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: "cc-refresh", expiresAt, subscriptionType: "max" } });
+  const agentAuth = (token: string, expires: number) => ({ anthropic: { type: "oauth", access: token, refresh: "agent-refresh", expires } });
+  const bearers = () => requests.filter((request) => request.url === USAGE).map((request) => (request.init.headers as Record<string, string>)["authorization"]);
+
+  beforeEach(() => {
+    write(join(home, ".claude.json"), { oauthAccount: { accountUuid: "uuid-1", emailAddress: "me@example.com" } });
+    replies.set(USAGE, { body: { five_hour: { utilization: 7, resets_at: null } } });
+    commands.set("ps -axo args=", "/sbin/launchd\n/usr/bin/zsh -l");
+  });
+
+  it("borrows another agent's fresh sign-in of the same account when Claude Code's expired, leaving every store as it was", async () => {
+    keychain.set("Claude Code-credentials|me", { status: "found", value: claudeCode("cc-old", NOW - HOUR) });
+    write(join(home, ".omo", "agent", "auth.json"), agentAuth("omo-expired", NOW - 1));
+    write(join(home, ".pi", "agent", "auth.json"), agentAuth("pi-fresh", NOW + HOUR));
+    const before = [await Bun.file(join(home, ".omo", "agent", "auth.json")).text(), await Bun.file(join(home, ".pi", "agent", "auth.json")).text()];
+    replies.set(PROFILE, { body: { account: { uuid: "uuid-1" } } });
+    const [usage] = (await new UsageService(context("darwin"), only("claude")).report()).providers;
+    expect(usage).toMatchObject({ key: "claude:uuid-1", account: "me@example.com", plan: "max", problem: null });
+    expect(bearers()).toEqual(["Bearer pi-fresh"]);
+    // an expired one is never sent, not even to ask whose it is
+    expect(requests.filter((request) => request.url === PROFILE).map((request) => (request.init.headers as Record<string, string>)["authorization"])).toEqual(["Bearer pi-fresh"]);
+    expect(authStatus).toEqual([]);
+    expect([await Bun.file(join(home, ".omo", "agent", "auth.json")).text(), await Bun.file(join(home, ".pi", "agent", "auth.json")).text()]).toEqual(before);
+  });
+
+  it("does not borrow another account's sign-in: Claude Code renews its own, which is read again", async () => {
+    write(join(home, ".claude", ".credentials.json"), claudeCode("cc-old", NOW - HOUR));
+    write(join(home, ".omo", "agent", "auth.json"), agentAuth("someone-else", NOW + HOUR));
+    replies.set(PROFILE, { body: { account: { uuid: "uuid-2" } } });
+    onAuthStatus = () => write(join(home, ".claude", ".credentials.json"), claudeCode("cc-new", NOW + 8 * HOUR));
+    const [usage] = (await new UsageService(context(), only("claude")).report()).providers;
+    expect(authStatus).toEqual([null]);
+    expect(bearers()).toEqual(["Bearer cc-new"]);
+    expect(usage).toMatchObject({ key: "claude:uuid-1", problem: null });
+  });
+
+  it("asks Claude Code to renew a token about to expire, and uses it meanwhile when nothing changed", async () => {
+    write(join(home, ".claude", ".credentials.json"), claudeCode("cc-soon", NOW + 60_000));
+    const [usage] = (await new UsageService(context(), only("claude")).report()).providers;
+    expect(authStatus).toEqual([null]);
+    expect(bearers()).toEqual(["Bearer cc-soon"]);
+    expect(usage!.problem).toBeNull();
+  });
+
+  it("never asks while Claude Code runs, or when it cannot tell, and says the sign-in expired", async () => {
+    write(join(home, ".claude", ".credentials.json"), claudeCode("cc-old", NOW - HOUR));
+    commands.set("ps -axo args=", "/sbin/launchd\nclaude --dangerously-skip-permissions");
+    const [usage] = (await new UsageService(context(), only("claude")).report()).providers;
+    expect(usage!.problem).toBe("expired");
+    commands.set("ps -axo args=", "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js -p hi");
+    await new UsageService(context(), only("claude")).report();
+    commands.delete("ps -axo args=");
+    await new UsageService(context(), only("claude")).report();
+    expect(authStatus).toEqual([]);
+    expect(bearers()).toEqual([]);
+  });
+
+  it("asks once per expiry, again only after CLAUDE_SELF_REFRESH_RETRY_MS, and for the config dir it belongs to", async () => {
+    const dir = join(home, ".claude-work");
+    write(join(dir, ".credentials.json"), claudeCode("work-old", NOW - HOUR));
+    const service = new UsageService(context(), only("claude"));
+    await service.report();
+    now += MIN_REFRESH_MS;
+    await service.report(true);
+    expect(authStatus).toEqual([dir]);
+    now += CLAUDE_SELF_REFRESH_RETRY_MS;
+    await service.report(true);
+    expect(authStatus).toEqual([dir, dir]);
+  });
+
+  it("runs one renewal at a time for concurrent reads", async () => {
+    write(join(home, ".claude", ".credentials.json"), claudeCode("cc-old", NOW - HOUR));
+    let finish!: () => void;
+    const started = new Promise<void>((begun) => {
+      onAuthStatus = () => new Promise<void>((resolve) => { finish = resolve; begun(); });
+    });
+    const ctx = context();
+    const [provider] = only("claude");
+    const reads = [provider!.signIns(ctx), provider!.signIns(ctx)];
+    await started;
+    write(join(home, ".claude", ".credentials.json"), claudeCode("cc-new", NOW + HOUR));
+    finish();
+    const found = await Promise.all(reads);
+    expect(authStatus).toEqual([null]);
+    expect(found.map((signIns) => (signIns[0] as { token: string }).token)).toEqual(["cc-new", "cc-new"]);
   });
 });
 

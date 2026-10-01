@@ -168,7 +168,7 @@ The strip beside **Settings** shows the plan limits of the AI tools signed in on
 
 | Provider | Sign-in it reads |
 | --- | --- |
-| Claude | Claude Code: the macOS keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json`; the same for each config directory in `CLAUDE_CONFIG_DIR` or `~/.claude-*`. The email from its `.claude.json` |
+| Claude | Claude Code: the macOS keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json`; the same for each config directory in `CLAUDE_CONFIG_DIR` or `~/.claude-*`. The email from its `.claude.json`. When its token has expired, a fresh Anthropic sign-in of the same account in `~/.omo/agent/auth.json` or `~/.pi/agent/auth.json` |
 | Codex | `auth.json` in `CODEX_HOME`, `~/.config/codex`, `~/.codex` and each `~/.codex-*`, else the macOS keychain item `Codex Auth`. The email in its token |
 | Cursor | The Cursor app's `state.vscdb` and the `cursor-agent` CLI's macOS keychain item, once when both are one account. Its monthly share, and within it Cursor's own models and the rest |
 | Copilot | `~/.config/github-copilot/apps.json` or `hosts.json`, then every account the GitHub CLI holds (`gh auth status`): per GitHub login, the first token that finds a plan |
@@ -177,11 +177,11 @@ The strip beside **Settings** shows the plan limits of the AI tools signed in on
 
 Only providers with a sign-in are shown; a GitHub account without Copilot is left out. One PC signed in to two accounts of a provider shows both, each named by its email (a login for Copilot) and told apart by its account id, so the same account found in two places counts once. A credential file, a command's output or a provider's answer over 1 MiB is treated as unreadable. Where each sign-in lives and which endpoint states its limits follows [OpenUsage](https://github.com/robinebers/openusage).
 
-- **Read only.** The server never refreshes a token: Claude, Codex, Cursor and Grok rotate refresh tokens, and a refresh the tool did not make would sign it out. An expired sign-in says so; using the tool once renews it.
+- **Read only.** The server never refreshes a token: Claude, Codex, Cursor and Grok rotate refresh tokens, and a refresh the tool did not make would sign it out. An expired sign-in says so; using the tool once renews it. Claude is the one exception, and Claude Code still does the renewing: when its token is about to expire or has expired and no other sign-in of the same account is fresh, the server runs `claude auth status` (no model call), once per expiry, and never while Claude Code is running. Another tool's sign-in is only read, after the profile endpoint confirms it is the same account.
 - **Asked only while someone looks.** Nothing runs in the background. The server asks a provider at most every five minutes, a refresh from the popover at most every 30 seconds, and a provider that answered 429 not before it said to.
 - **Yours to arrange.** Settings → Subscription usage orders the accounts (until then the one nearest a limit comes first), hides any (from the strip and its popover alike), and switches the meters between what is used and what is left.
 - **The server's PC only.** Remote PCs are not included.
-- A macOS keychain the server's session cannot open (a server started outside the logged-in desktop session, for one) shows as such instead of the numbers.
+- On macOS, a server started outside the logged-in desktop session (over SSH, or by a multiplexer started there) reads the keychain item through a one-shot job in that desktop session. A keychain that still cannot be opened shows as such instead of the numbers.
 
 ## On your phone
 

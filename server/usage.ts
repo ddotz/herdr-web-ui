@@ -10,6 +10,11 @@
  * rotate refresh tokens, so a refresh the CLI did not make logs the CLI out. An expired token is
  * reported as `expired` instead; the CLI refreshes its own file the next time it runs.
  *
+ * Claude Code gets two more chances before that: a fresh sign-in of the same account that another
+ * local agent holds (omo, pi) is borrowed, read only; failing that, Claude Code itself is asked to
+ * renew its own sign-in with `claude auth status`, which refreshes a token within five minutes of
+ * expiry and calls no model. Its token is still never refreshed or written here.
+ *
  * Nothing runs in the background: a provider is asked only when a client asks this server, at
  * most every FRESH_MS unless the client forces it, which is still limited to one ask per
  * MIN_REFRESH_MS. A provider that answered 429 is not asked again before it said to.
@@ -17,8 +22,9 @@
 
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { closeSync, openSync, readdirSync, readSync } from "node:fs";
-import { homedir } from "node:os";
+import { closeSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderUsage, UsageProblem, UsageProviderId, UsageReport, UsageWindow } from "../shared/protocol.ts";
 import { jsonResponse } from "./http.ts";
@@ -44,6 +50,11 @@ export interface UsageContext {
   keychain(service: string, account?: string): Promise<KeychainRead>;
   /** a command's trimmed stdout, or null when it is missing, fails or hangs */
   run(argv: string[]): Promise<string | null>;
+  /**
+   * Runs Claude Code's `claude auth status` for a config dir (null: the default one) where it can
+   * reach its keychain item, so Claude Code renews its own sign-in; resolves when it is done.
+   */
+  claudeAuthStatus(configDir: string | null): Promise<void>;
   now(): number;
 }
 
@@ -267,6 +278,107 @@ function claudeSignIn(source: string | null): SignIn | null {
   return token ? { token, expiresAt: number(oauth["expiresAt"]), plan: text(oauth["subscriptionType"]) } : null;
 }
 
+/** Claude Code refreshes its token from this long before expiry; `claude auth status` sooner does nothing. */
+export const CLAUDE_REFRESH_WINDOW_MS = 5 * 60_000;
+/** a self-refresh that left the token as it was is tried again after this */
+export const CLAUDE_SELF_REFRESH_RETRY_MS = 30 * 60_000;
+const CLAUDE_PROFILE = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_BETA = "oauth-2025-04-20";
+
+/** what the Claude provider remembers between reads of one context: never a token */
+interface ClaudeState {
+  /** by config dir: the expiry a self-refresh was last asked for, and when */
+  asked: Map<string, { expiresAt: number | null; at: number }>;
+  /** by config dir: the self-refresh running now */
+  running: Map<string, Promise<boolean>>;
+  /** by token hash: the account a borrowed token belongs to, null when it would not say */
+  owners: Map<string, string | null>;
+}
+const claudeStates = new WeakMap<UsageContext, ClaudeState>();
+function claudeState(ctx: UsageContext): ClaudeState {
+  let state = claudeStates.get(ctx);
+  if (!state) claudeStates.set(ctx, state = { asked: new Map(), running: new Map(), owners: new Map() });
+  return state;
+}
+
+/** One Claude Code config dir's sign-in, as Claude Code keeps it: the keychain item first, then the file. */
+async function claudeCodeSignIns(ctx: UsageContext, home: ReturnType<typeof claudeHomes>[number], account: Account | null): Promise<Found[]> {
+  const user = ctx.env["USER"];
+  const keychain = await fromKeychain(ctx, home.service, user ? [user, undefined] : [undefined], claudeSignIn);
+  if (keychain && keychain !== "locked") return keychainFound(keychain, home.source, account);
+  const file = claudeSignIn(readText(join(home.dir, ".credentials.json")));
+  if (file) return [{ ...file, account, source: home.source }];
+  return keychainFound(keychain, home.source, account);
+}
+
+/**
+ * The Anthropic sign-ins other local agents keep (omo, pi): `anthropic` of type "oauth" in their
+ * auth.json. Read only: they rotate their refresh tokens like Claude Code does.
+ */
+function borrowableClaudeTokens(ctx: UsageContext): Array<{ token: string; expiresAt: number | null }> {
+  return [join(ctx.home, ".omo", "agent", "auth.json"), join(ctx.home, ".pi", "agent", "auth.json")].flatMap((path) => {
+    const entry = record(record(parseJson(readText(path)))["anthropic"]);
+    const token = text(entry["access"]);
+    return entry["type"] === "oauth" && token ? [{ token, expiresAt: epochMs(entry["expires"]) }] : [];
+  });
+}
+
+/** the account a Claude token belongs to, as the profile endpoint states it; null when it would not say */
+async function claudeTokenOwner(ctx: UsageContext, token: string): Promise<string | null> {
+  const owners = claudeState(ctx).owners;
+  const hash = createHash("sha256").update(token).digest("hex");
+  if (owners.has(hash)) return owners.get(hash)!;
+  let owner: string | null = null;
+  try {
+    const body = await requestJson(ctx, CLAUDE_PROFILE, { headers: { authorization: `Bearer ${token}`, accept: "application/json", "anthropic-beta": CLAUDE_BETA, "user-agent": USER_AGENT } });
+    owner = text(record(body["account"])["uuid"]);
+  } catch { /* refused or unreachable: not borrowed */ }
+  owners.set(hash, owner);
+  return owner;
+}
+
+/** another local agent's unexpired sign-in of `account`, when there is one */
+async function borrowClaude(ctx: UsageContext, account: Account): Promise<SignIn | null> {
+  for (const candidate of borrowableClaudeTokens(ctx)) {
+    if (candidate.expiresAt !== null && candidate.expiresAt <= ctx.now()) continue;
+    if (await claudeTokenOwner(ctx, candidate.token) === account.id) return candidate;
+  }
+  return null;
+}
+
+/** whether a Claude Code process runs on this PC; true when that cannot be told */
+async function claudeCodeRunning(ctx: UsageContext): Promise<boolean> {
+  const processes = await ctx.run(["ps", "-axo", "args="]);
+  if (processes === null) return true;
+  return processes.split("\n").some((line) => {
+    const [command = "", script = ""] = line.trim().split(/\s+/);
+    return command.split("/").pop() === "claude" || script.endsWith("@anthropic-ai/claude-code/cli.js");
+  });
+}
+
+/**
+ * Asks Claude Code to renew its own sign-in in `home`, at most once per expiry (again after
+ * CLAUDE_SELF_REFRESH_RETRY_MS) and never while Claude Code runs: a running one refreshes on its
+ * own, and two refreshes of one rotating token log it out. true when it was asked.
+ */
+function claudeSelfRefresh(ctx: UsageContext, home: ReturnType<typeof claudeHomes>[number], expiresAt: number | null): Promise<boolean> {
+  const state = claudeState(ctx);
+  const running = state.running.get(home.source);
+  if (running) return running;
+  const asked = state.asked.get(home.source);
+  if (asked && asked.expiresAt === expiresAt && ctx.now() - asked.at < CLAUDE_SELF_REFRESH_RETRY_MS) return Promise.resolve(false);
+  const pass = (async () => {
+    if (await claudeCodeRunning(ctx)) return false;
+    state.asked.set(home.source, { expiresAt, at: ctx.now() });
+    try { await ctx.claudeAuthStatus(home.source === "default" ? null : home.dir); } catch (error) {
+      console.warn(`usage: claude auth status failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return true;
+  })().finally(() => state.running.delete(home.source));
+  state.running.set(home.source, pass);
+  return pass;
+}
+
 function claudeWindow(value: unknown, kind: UsageWindow["kind"], scope: string | null): UsageWindow | null {
   const window = record(value);
   const used = number(window["utilization"]);
@@ -276,19 +388,24 @@ function claudeWindow(value: unknown, kind: UsageWindow["kind"], scope: string |
 const claude: UsageProvider = {
   id: "claude",
   async signIns(ctx) {
-    const user = ctx.env["USER"];
-    const found = await Promise.all(claudeHomes(ctx).map(async (home) => {
+    const found = await Promise.all(claudeHomes(ctx).map(async (home): Promise<Found[]> => {
       const account = claudeAccount(home.config);
-      const keychain = await fromKeychain(ctx, home.service, user ? [user, undefined] : [undefined], claudeSignIn);
-      if (keychain && keychain !== "locked") return keychainFound(keychain, home.source, account);
-      const file = claudeSignIn(readText(join(home.dir, ".credentials.json")));
-      return file ? [{ ...file, account, source: home.source }] : keychainFound(keychain, home.source, account);
+      const found = await claudeCodeSignIns(ctx, home, account);
+      const own = found[0] !== undefined && !("locked" in found[0]) ? found[0] : null;
+      if (own === null || own.expiresAt === null || own.expiresAt - ctx.now() > CLAUDE_REFRESH_WINDOW_MS) return found;
+      // expired: the same account's fresh sign-in in another agent stands in, as it is
+      if (own.expiresAt <= ctx.now() && account) {
+        const borrowed = await borrowClaude(ctx, account);
+        if (borrowed) return [{ ...borrowed, plan: own.plan ?? null, account, source: home.source }];
+      }
+      // about to expire or expired, with nothing to borrow: Claude Code renews its own, then it is read again
+      return await claudeSelfRefresh(ctx, home, own.expiresAt) ? claudeCodeSignIns(ctx, home, account) : found;
     }));
     return found.flat();
   },
   async read(ctx, signIn) {
     const body = await requestJson(ctx, "https://api.anthropic.com/api/oauth/usage", {
-      headers: { authorization: `Bearer ${signIn.token}`, accept: "application/json", "anthropic-beta": "oauth-2025-04-20", "user-agent": USER_AGENT },
+      headers: { authorization: `Bearer ${signIn.token}`, accept: "application/json", "anthropic-beta": CLAUDE_BETA, "user-agent": USER_AGENT },
     });
     const windows = [
       claudeWindow(body["five_hour"], "session", null),
@@ -643,12 +760,67 @@ async function readKeychain(service: string, account?: string): Promise<Keychain
     if (code === 0) return { status: "found", value: output.trim() };
     // 44: errSecItemNotFound. Anything else found an item it could not read (36: a locked keychain).
     if (code === 44 && !timedOut) return { status: "missing" };
+    // 36 without a prompt: this server runs outside the login (Aqua) session - started over SSH or by a
+    // detached multiplexer - where the login keychain refuses any read. Ask from the login session instead.
+    if (code === 36 && !timedOut) {
+      const gui = await readKeychainInLoginSession(service, account);
+      if (gui !== null) return { status: "found", value: gui };
+    }
     if (timedOut) promptedServices.add(service);
     return { status: "locked" };
   } catch {
     return { status: "missing" };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+const xml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/**
+ * Reads a keychain item through a one-shot launchd job in the user's gui/<uid> domain, which runs in the
+ * login session where the keychain is unlocked. The value comes back through a FIFO, never a file on disk.
+ * null when not on macOS, the job cannot be loaded, or nothing came back in time.
+ */
+async function readKeychainInLoginSession(service: string, account?: string): Promise<string | null> {
+  return runInLoginSession(["/usr/bin/security", "find-generic-password", "-s", service, ...(account ? ["-a", account] : []), "-w"]);
+}
+
+/** A command's trimmed stdout, run as a one-shot launchd job in the login session; null as above. */
+async function runInLoginSession(args: string[], env: Record<string, string> = {}, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string | null> {
+  if (process.platform !== "darwin" || typeof process.getuid !== "function") return null;
+  const domain = `gui/${process.getuid()}`;
+  const label = `dev.herdr-web-ui.login-session.${process.pid}.${Date.now()}`;
+  const dir = mkdtempSync(join(tmpdir(), "herdr-web-ui-keychain-"));
+  const fifo = join(dir, "out");
+  const plist = join(dir, "job.plist");
+  try {
+    if (Bun.spawnSync(["mkfifo", "-m", "600", fifo]).exitCode !== 0) return null;
+    const environment = Object.entries(env).map(([key, value]) => `<key>${xml(key)}</key><string>${xml(value)}</string>`).join("");
+    writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${args.map((a) => `<string>${xml(a)}</string>`).join("")}</array><key>EnvironmentVariables</key><dict>${environment}</dict><key>WorkingDirectory</key><string>${xml(tmpdir())}</string><key>StandardOutPath</key><string>${xml(fifo)}</string><key>StandardErrorPath</key><string>/dev/null</string><key>RunAtLoad</key><true/></dict></plist>
+`, { mode: 0o600 });
+    // open for reading before the job starts; the open completes when the job opens its stdout
+    const reading = open(fifo, "r").then(async (handle) => {
+      try { return (await handle.readFile("utf8")).trim(); } finally { await handle.close(); }
+    });
+    const load = Bun.spawnSync(["launchctl", "bootstrap", domain, plist], { stdout: "ignore", stderr: "ignore" });
+    if (load.exitCode !== 0) {
+      closeSync(openSync(fifo, "r+")); // releases the pending reader
+      await reading.catch(() => "");
+      return null;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<string>((resolve) => { timer = setTimeout(() => { closeSync(openSync(fifo, "r+")); resolve(""); }, timeoutMs); });
+    const value = await Promise.race([reading.catch(() => ""), timeout]);
+    clearTimeout(timer);
+    return value ? value : null;
+  } catch {
+    return null;
+  } finally {
+    Bun.spawnSync(["launchctl", "bootout", `${domain}/${label}`], { stdout: "ignore", stderr: "ignore" });
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -668,6 +840,31 @@ export async function runCommand(argv: string[]): Promise<string | null> {
   }
 }
 
+/** `claude auth status` takes a fraction of a second; a refresh it makes waits on the network */
+const CLAUDE_AUTH_STATUS_TIMEOUT_MS = 30_000;
+
+/**
+ * Claude Code's `claude auth status`, which renews a sign-in about to expire. On macOS it runs in the
+ * login session, where Claude Code can read and update its keychain item; its output (the account's
+ * email) is dropped.
+ */
+async function claudeAuthStatus(configDir: string | null): Promise<void> {
+  const home = homedir();
+  const bin = Bun.which("claude") ?? [join(home, ".local", "bin", "claude"), join(home, ".claude", "local", "claude")].find((path) => Bun.file(path).size > 0);
+  if (!bin) return;
+  const env: Record<string, string> = {
+    HOME: home, PATH: process.env["PATH"] ?? "/usr/bin:/bin", ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
+    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+  };
+  if (process.platform === "darwin") {
+    await runInLoginSession([bin, "auth", "status"], env, CLAUDE_AUTH_STATUS_TIMEOUT_MS);
+    return;
+  }
+  const child = Bun.spawn([bin, "auth", "status"], { env, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  const timer = setTimeout(() => child.kill(), CLAUDE_AUTH_STATUS_TIMEOUT_MS);
+  try { await child.exited; } finally { clearTimeout(timer); }
+}
+
 export function systemUsageContext(): UsageContext {
   return {
     home: homedir(),
@@ -676,6 +873,7 @@ export function systemUsageContext(): UsageContext {
     fetch: (url, init) => fetch(url, init),
     keychain: readKeychain,
     run: runCommand,
+    claudeAuthStatus,
     now: Date.now,
   };
 }

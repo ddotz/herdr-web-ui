@@ -25,6 +25,14 @@ between releases do not reach them. Remote-PC runtime bundles are versioned sepa
   that also rewrites `Host` and adds nothing, as nginx's plain `proxy_pass` does, still cannot
   be told from this computer, so set a token behind a proxy. The guide has Caddy and nginx
   examples to copy ([#252](https://github.com/devswha/herdr-web-ui/pull/252)).
+- Claude's subscription usage no longer shows a locked keychain on a Mac whose server was
+  started outside the desktop session (over SSH, or by a detached multiplexer), where
+  `security` cannot open the login keychain. The item is read through a one-shot launchd job
+  in the desktop session instead.
+- Claude's subscription usage no longer stops at "expired" while Claude Code is idle. A fresh
+  sign-in of the same account held by omo or pi is read and used as it is, and otherwise
+  Claude Code is asked to renew its own with `claude auth status` (no model call), once per
+  expiry and never while Claude Code runs. The server still never refreshes or writes a token.
 
 ## [0.3.39] - 2026-10-01
 
