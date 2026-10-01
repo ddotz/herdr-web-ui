@@ -280,8 +280,11 @@ const claude: UsageProvider = {
     const found = await Promise.all(claudeHomes(ctx).map(async (home) => {
       const account = claudeAccount(home.config);
       const keychain = await fromKeychain(ctx, home.service, user ? [user, undefined] : [undefined], claudeSignIn);
-      if (keychain && keychain !== "locked") return keychainFound(keychain, home.source, account);
       const file = claudeSignIn(readText(join(home.dir, ".credentials.json")));
+      // Claude Code refreshes the file alone when it cannot write the keychain (started outside the
+      // desktop session), so the item can hold a token that expired hours ago: the later one wins
+      const item = keychain && keychain !== "locked" ? keychain : null;
+      if (item && (!file || (file.expiresAt ?? 0) <= (item.expiresAt ?? 0))) return keychainFound(item, home.source, account);
       return file ? [{ ...file, account, source: home.source }] : keychainFound(keychain, home.source, account);
     }));
     return found.flat();

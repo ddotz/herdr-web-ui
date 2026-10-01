@@ -124,6 +124,23 @@ describe("providers", () => {
     ]);
   });
 
+  it("reads the Claude credentials file when Claude Code refreshed it but not the keychain item", async () => {
+    keychain.set("Claude Code-credentials|me", { status: "found", value: JSON.stringify({ claudeAiOauth: { accessToken: "stale", expiresAt: NOW - HOUR } }) });
+    write(join(home, ".claude", ".credentials.json"), { claudeAiOauth: { accessToken: "file", expiresAt: NOW + 8 * HOUR } });
+    replies.set("https://api.anthropic.com/api/oauth/usage", { body: { five_hour: { utilization: 1, resets_at: null } } });
+    const [usage] = (await new UsageService(context("darwin"), only("claude")).report()).providers;
+    expect((requests[0]!.init.headers as Record<string, string>)["authorization"]).toBe("Bearer file");
+    expect(usage!.problem).toBeNull();
+  });
+
+  it("keeps the Claude keychain item when the credentials file is older", async () => {
+    keychain.set("Claude Code-credentials|me", { status: "found", value: JSON.stringify({ claudeAiOauth: { accessToken: "k", expiresAt: NOW + 8 * HOUR } }) });
+    write(join(home, ".claude", ".credentials.json"), { claudeAiOauth: { accessToken: "old", expiresAt: NOW - HOUR } });
+    replies.set("https://api.anthropic.com/api/oauth/usage", { body: { five_hour: { utilization: 1, resets_at: null } } });
+    await new UsageService(context("darwin"), only("claude")).report();
+    expect((requests[0]!.init.headers as Record<string, string>)["authorization"]).toBe("Bearer k");
+  });
+
   it("lists each Codex account once, from ~/.codex and a ~/.codex-* sibling", async () => {
     signInCodex(NOW / 1000 + 3600, ".codex", "user-1", "work@example.com");
     signInCodex(NOW / 1000 + 7200, ".codex-personal", "user-2", "me@example.com");
