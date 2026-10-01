@@ -789,6 +789,13 @@ async function readKeychainInLoginSession(service: string, account?: string): Pr
 /** launchd labels must be unique per call: concurrent reads for different config dirs can start in the same millisecond. */
 let loginSessionJobs = 0;
 
+/** `launchctl <args>`'s exit code, killed after `timeoutMs` so a stalled launchctl cannot hold up the caller. */
+async function launchctl(args: string[], timeoutMs: number): Promise<number> {
+  const child = Bun.spawn(["launchctl", ...args], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  const timer = setTimeout(() => child.kill(), timeoutMs);
+  try { return await child.exited; } finally { clearTimeout(timer); }
+}
+
 /** A command's trimmed stdout, run as a one-shot launchd job in the login session; null as above. */
 async function runInLoginSession(args: string[], env: Record<string, string> = {}, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string | null> {
   if (process.platform !== "darwin" || typeof process.getuid !== "function") return null;
@@ -808,8 +815,7 @@ async function runInLoginSession(args: string[], env: Record<string, string> = {
     const reading = open(fifo, "r").then(async (handle) => {
       try { return (await handle.readFile("utf8")).trim(); } finally { await handle.close(); }
     });
-    const load = Bun.spawnSync(["launchctl", "bootstrap", domain, plist], { stdout: "ignore", stderr: "ignore" });
-    if (load.exitCode !== 0) {
+    if (await launchctl(["bootstrap", domain, plist], timeoutMs) !== 0) {
       closeSync(openSync(fifo, "r+")); // releases the pending reader
       await reading.catch(() => "");
       return null;
@@ -822,7 +828,7 @@ async function runInLoginSession(args: string[], env: Record<string, string> = {
   } catch {
     return null;
   } finally {
-    Bun.spawnSync(["launchctl", "bootout", `${domain}/${label}`], { stdout: "ignore", stderr: "ignore" });
+    await launchctl(["bootout", `${domain}/${label}`], timeoutMs);
     rmSync(dir, { recursive: true, force: true });
   }
 }
